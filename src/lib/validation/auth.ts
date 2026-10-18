@@ -34,6 +34,20 @@ export const loginSchema = z.object({
   next: z.string().optional(),
 });
 
+export const signupOtpSchema = z.object({
+  email: emailField,
+  token: z
+    .string()
+    .trim()
+    .regex(/^\d{6,10}$/, "Kode verifikasi harus berupa 6–10 digit angka."),
+  next: z.string().optional(),
+});
+
+export const resendSignupOtpSchema = z.object({
+  email: emailField,
+  next: z.string().optional(),
+});
+
 export const forgotPasswordSchema = z.object({
   email: emailField,
 });
