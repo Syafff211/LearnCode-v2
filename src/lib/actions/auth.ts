@@ -4,18 +4,23 @@ import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 
 import { getAppUrl, isSupabaseConfigured } from "@/lib/env";
+import { authActionLimiter } from "@/lib/rate-limit";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { safeRedirectPath } from "@/lib/utils";
 import {
   forgotPasswordSchema,
   loginSchema,
   registerSchema,
+  resendSignupOtpSchema,
   resetPasswordSchema,
+  signupOtpSchema,
 } from "@/lib/validation/auth";
 
 export type AuthActionState = {
   status: "idle" | "error" | "success" | "verify-email";
   message?: string;
+  email?: string;
+  next?: string;
   fieldErrors?: Record<string, string[]>;
 };
 
@@ -33,13 +38,19 @@ function zodFieldErrors(error: {
   return fieldErrors;
 }
 
+function getSignupRedirectUrl(next: string): string {
+  const callback = new URL("/auth/callback", getAppUrl());
+  callback.searchParams.set("next", safeRedirectPath(next, "/dashboard"));
+  return callback.toString();
+}
+
 function translateAuthError(message: string): string {
   const normalized = message.toLowerCase();
   if (normalized.includes("invalid login credentials")) {
     return "Email atau password salah. Periksa kembali lalu coba lagi.";
   }
   if (normalized.includes("email not confirmed")) {
-    return "Email kamu belum diverifikasi. Buka tautan konfirmasi di inbox, lalu coba masuk lagi.";
+    return "Email kamu belum diverifikasi. Masukkan kode yang dikirim ke email saat mendaftar. Jika perlu, kembali ke halaman pendaftaran untuk meminta kode baru.";
   }
   if (normalized.includes("already registered") || normalized.includes("already been registered")) {
     return "Email ini sudah terdaftar. Coba masuk atau gunakan fitur lupa password.";
@@ -78,9 +89,18 @@ export async function signInAction(
     };
   }
 
+  const email = parsed.data.email.toLowerCase();
+  const limit = authActionLimiter.check(`user-sign-in:${email}`);
+  if (!limit.allowed) {
+    return {
+      status: "error",
+      message: `Terlalu banyak percobaan masuk. Coba lagi dalam ${limit.retryAfterSeconds} detik.`,
+    };
+  }
+
   const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase.auth.signInWithPassword({
-    email: parsed.data.email,
+    email,
     password: parsed.data.password,
   });
 
@@ -130,29 +150,190 @@ export async function signUpAction(
     };
   }
 
+  const email = parsed.data.email.toLowerCase();
+  const next = safeRedirectPath(String(formData.get("next") ?? ""), "/dashboard");
+  const limit = authActionLimiter.check(`user-sign-up:${email}`);
+  if (!limit.allowed) {
+    return {
+      status: "error",
+      message: `Terlalu banyak percobaan daftar. Coba lagi dalam ${limit.retryAfterSeconds} detik.`,
+    };
+  }
+
   const supabase = await createSupabaseServerClient();
+  const emailRedirectTo = getSignupRedirectUrl(next);
   const { data, error } = await supabase.auth.signUp({
-    email: parsed.data.email,
+    email,
     password: parsed.data.password,
     options: {
       data: { full_name: parsed.data.fullName },
-      emailRedirectTo: `${getAppUrl()}/auth/callback?next=/dashboard`,
+      emailRedirectTo,
     },
   });
 
   if (error) {
+    const normalized = error.message.toLowerCase();
+    if (normalized.includes("already registered") || normalized.includes("already been registered")) {
+      // Allow a person who left the page to request another code without
+      // exposing whether a registered address is already confirmed.
+      const { error: resendError } = await supabase.auth.resend({
+        type: "signup",
+        email,
+        options: { emailRedirectTo },
+      });
+      if (!resendError) {
+        return {
+          status: "verify-email",
+          email,
+          next,
+          message: `Jika akun ${email} belum diverifikasi, kode baru akan dikirim ke email tersebut.`,
+        };
+      }
+    }
     return { status: "error", message: translateAuthError(error.message) };
   }
 
-  // If email confirmation is disabled Supabase returns a session immediately.
+  // With Supabase "Confirm email" enabled, there is no session until the OTP
+  // below is verified. A session here means that email confirmation is disabled.
   if (data.session) {
     revalidatePath("/", "layout");
-    redirect("/dashboard");
+    redirect(next);
   }
 
   return {
     status: "verify-email",
-    message: `Kami mengirim tautan verifikasi ke ${parsed.data.email}. Buka tautan tersebut untuk mengaktifkan akun, lalu masuk.`,
+    email,
+    next,
+    message: `Kami mengirim kode verifikasi ke ${email}. Masukkan kode tersebut untuk mengaktifkan akun.`,
+  };
+}
+
+export async function verifySignUpOtpAction(
+  _prevState: AuthActionState,
+  formData: FormData,
+): Promise<AuthActionState> {
+  if (!isSupabaseConfigured()) {
+    return { status: "error", message: SETUP_MESSAGE };
+  }
+
+  const parsed = signupOtpSchema.safeParse({
+    email: formData.get("email"),
+    token: formData.get("token"),
+    next: formData.get("next") ?? undefined,
+  });
+  if (!parsed.success) {
+    return {
+      status: "error",
+      message: "Periksa kembali email dan kode verifikasi.",
+      fieldErrors: zodFieldErrors(parsed.error),
+    };
+  }
+
+  const email = parsed.data.email.toLowerCase();
+  const next = safeRedirectPath(parsed.data.next, "/dashboard");
+  const limit = authActionLimiter.check(`signup-verify:${email}`);
+  if (!limit.allowed) {
+    return {
+      status: "error",
+      message: `Terlalu banyak percobaan kode. Coba lagi dalam ${limit.retryAfterSeconds} detik.`,
+    };
+  }
+
+  const supabase = await createSupabaseServerClient();
+  const { data, error } = await supabase.auth.verifyOtp({
+    email,
+    token: parsed.data.token,
+    type: "email",
+  });
+
+  if (error || !data.user) {
+    return {
+      status: "error",
+      message: "Kode salah atau sudah kedaluwarsa. Periksa email atau minta kode baru.",
+    };
+  }
+
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("suspended_at")
+    .eq("id", data.user.id)
+    .maybeSingle();
+  if (profile?.suspended_at) {
+    await supabase.auth.signOut().catch(() => undefined);
+    return {
+      status: "error",
+      message: "Akun ini sedang dinonaktifkan oleh administrator.",
+    };
+  }
+
+  if (data.session) {
+    revalidatePath("/", "layout");
+    redirect(next);
+  }
+
+  return {
+    status: "success",
+    next,
+    message: "Email berhasil diverifikasi. Silakan masuk dengan email dan password yang dibuat.",
+  };
+}
+
+export async function resendSignupOtpAction(
+  _prevState: AuthActionState,
+  formData: FormData,
+): Promise<AuthActionState> {
+  if (!isSupabaseConfigured()) {
+    return { status: "error", message: SETUP_MESSAGE };
+  }
+
+  const parsed = resendSignupOtpSchema.safeParse({
+    email: formData.get("email"),
+    next: formData.get("next") ?? undefined,
+  });
+  if (!parsed.success) {
+    return {
+      status: "error",
+      message: "Masukkan alamat email yang valid.",
+      fieldErrors: zodFieldErrors(parsed.error),
+    };
+  }
+
+  const email = parsed.data.email.toLowerCase();
+  const next = safeRedirectPath(parsed.data.next, "/dashboard");
+  const limit = authActionLimiter.check(`signup-resend:${email}`);
+  if (!limit.allowed) {
+    return {
+      status: "error",
+      message: `Terlalu banyak permintaan kode. Coba lagi dalam ${limit.retryAfterSeconds} detik.`,
+    };
+  }
+
+  const supabase = await createSupabaseServerClient();
+  const { error } = await supabase.auth.resend({
+    type: "signup",
+    email,
+    options: { emailRedirectTo: getSignupRedirectUrl(next) },
+  });
+
+  if (error) {
+    const normalized = error.message.toLowerCase();
+    if (normalized.includes("rate limit") || normalized.includes("too many")) {
+      return {
+        status: "error",
+        message: "Kode baru saja dikirim. Tunggu sebentar sebelum meminta kode lagi.",
+      };
+    }
+    return {
+      status: "error",
+      message: "Kode belum dapat dikirim. Coba lagi nanti; jika berlanjut, periksa konfigurasi SMTP Supabase.",
+    };
+  }
+
+  return {
+    status: "success",
+    message: `Jika akun ${email} belum diverifikasi, kode baru akan dikirim ke email tersebut.`,
+    email,
+    next,
   };
 }
 
