@@ -61,7 +61,21 @@ export function LoginForm({ next }: { next: string }) {
         ) : null}
       </div>
 
-      {state.status === "error" ? <FormMessage message={state.message} /> : null}
+      {state.status === "error" ? (
+        <div className="space-y-2">
+          <FormMessage message={state.message} />
+          {state.message?.includes("belum diverifikasi") ? (
+            <p className="text-xs text-muted">
+              <Link
+                href={`/register${next !== "/dashboard" ? `?next=${encodeURIComponent(next)}` : ""}`}
+                className="font-medium text-accent-text underline-offset-2 hover:underline"
+              >
+                Kembali ke pendaftaran untuk meminta kode baru
+              </Link>
+            </p>
+          ) : null}
+        </div>
+      ) : null}
 
       <Button type="submit" className="w-full" loading={pending}>
         {pending ? "Memeriksa…" : "Masuk"}
